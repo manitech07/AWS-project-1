@@ -1,0 +1,195 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless file-processing pipeline using AWS Lambda, API Gateway, S3, SNS, SQS, and EventBridge.
+
+Resources:
+
+  FileBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub file-pipeline-bucket-${AWS::AccountId}
+
+  FileUploadTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: FileUploadTopic
+
+  FileProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: FileProcessingQueue
+
+  FileUploadSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FileUploadTopic
+      Protocol: sqs
+      Endpoint: !GetAtt FileProcessingQueue.Arn
+      RawMessageDelivery: true
+
+  SQSQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref FileProcessingQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt FileProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref FileUploadTopic
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FilePipelineLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+
+  UploadHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UploadHandler
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json, boto3, uuid, os
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+          BUCKET = 'file-pipeline-bucket-' + boto3.client('sts').get_caller_identity()["Account"]
+          TOPIC_ARN = os.environ['TOPIC_ARN']
+
+          def handler(event, context):
+              body = json.loads(event['body'])
+              file_id = str(uuid.uuid4())
+              key = f"uploads/{file_id}.txt"
+              s3.put_object(Bucket=BUCKET, Key=key, Body=body['content'])
+              sns.publish(TopicArn=TOPIC_ARN, Message=json.dumps({"key": key}))
+              return {"statusCode": 200, "body": json.dumps({"file_id": file_id})}
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref FileUploadTopic
+
+  ProcessHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessHandler
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json, boto3
+          s3 = boto3.client('s3')
+          BUCKET = 'file-pipeline-bucket-' + boto3.client('sts').get_caller_identity()["Account"]
+
+          def handler(event, context):
+              for rec in event['Records']:
+                  msg = json.loads(rec['body'])
+                  key = msg['key']
+                  obj = s3.get_object(Bucket=BUCKET, Key=key)
+                  content = obj['Body'].read().decode()
+                  processed = "PROCESSED:\n" + content
+                  out_key = key.replace('uploads/', 'processed/')
+                  s3.put_object(Bucket=BUCKET, Key=out_key, Body=processed)
+
+  ProcessHandlerSQSTrigger:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt FileProcessingQueue.Arn
+      FunctionName: !Ref ProcessHandler
+
+  SummaryHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SummaryHandler
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json, boto3
+          s3 = boto3.client('s3')
+          BUCKET = 'file-pipeline-bucket-' + boto3.client('sts').get_caller_identity()["Account"]
+
+          def handler(event, context):
+              resp = s3.list_objects_v2(Bucket=BUCKET, Prefix='processed/')
+              files = [obj['Key'] for obj in resp.get('Contents', [])]
+              summary = {"processed_files": files}
+              s3.put_object(Bucket=BUCKET, Key='summary/summary.json', Body=json.dumps(summary, indent=2))
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: HourlySummaryRule
+      ScheduleExpression: rate(1 hour)
+      Targets:
+        - Arn: !GetAtt SummaryHandler.Arn
+          Id: TargetFunction
+
+  EventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SummaryHandler
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  UploadApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: UploadAPI
+      ProtocolType: HTTP
+
+  UploadApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref UploadApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadHandler.Arn}/invocations
+      PayloadFormatVersion: '2.0'
+
+  UploadApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref UploadApi
+      RouteKey: POST /upload
+      Target: !Sub integrations/${UploadApiIntegration}
+
+  UploadApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref UploadApi
+      StageName: prod
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UploadHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UploadApi}/*/*/upload
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint"
+    Value: !Sub "https://${UploadApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload"
+
+  Bucket:
+    Description: "S3 bucket used for file uploads"
+    Value: !Ref FileBucket
