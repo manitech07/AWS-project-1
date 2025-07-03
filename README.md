@@ -50,4 +50,18 @@ aws cloudformation deploy \
 curl -X POST https://<your-api-endpoint>/upload \
   -d '{"content":"Hello from Mani!"}' \
   -H "Content-Type: application/json"
+```
+
+## 👤 Author
+
+<p align="left">
+  <a href="https://github.com/<your-github-username>" target="_blank">
+    <img src="https://avatars.githubusercontent.com/<your-github-username>" width="100" style="border-radius: 50%;" />
+  </a>
+</p>
+
+**Manikanta Gunda**  
+☁️ Cloud and DevOps Engineer  
+🚀 Passionate about AWS, DevOps, and Automation  
+
 
